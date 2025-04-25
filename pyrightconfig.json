@@ -1,0 +1,12 @@
+{
+  "include": [
+      "."
+  ],
+  "extraPaths": [
+      "./venv/lib/python3.12/site-packages",
+      "./venv/lib/site-packages"
+  ],
+  "ignore": [
+      "venv"
+  ]
+}
