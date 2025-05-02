@@ -183,3 +183,5 @@ credentials.json
 Dockerfile
 
 docker-compose.yml
+
+cloudflared_config.yml
