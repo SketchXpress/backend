@@ -11,7 +11,7 @@ import uuid
 from diffusers import (
     StableDiffusionControlNetPipeline,
     ControlNetModel,
-    UniPCMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
     DiffusionPipeline
 )
 from diffusers.schedulers import DDPMScheduler
@@ -67,7 +67,7 @@ class EnhancedDiffusionModel:
 
             # Use correct type for scheduler replacement
             # We use the from_config method which returns a properly typed scheduler
-            new_scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+            new_scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
             # Type assertion to help Pylance understand
             self.pipe.scheduler = cast(DDPMScheduler, new_scheduler)
 
@@ -186,7 +186,7 @@ class EnhancedDiffusionModel:
                 images = getattr(output, "images", None)
                 if images and isinstance(images, list):
                     img_path = os.path.join(self.output_dir, f"{job_id}_{i}.png")
-                    images[0].save(img_path)
+                    images[0].save(img_path, compress_level=1)
                     image_paths.append(img_path)
 
                 current_step += num_inference_steps

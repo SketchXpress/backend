@@ -36,7 +36,7 @@ class ModelIntegration:
         self.jobs: Dict[str, Dict] = {}
         self.job_lock = threading.Lock()
 
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
         self.model = EnhancedDiffusionModel(
             output_dir=output_dir,

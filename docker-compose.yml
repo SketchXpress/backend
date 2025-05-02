@@ -2,11 +2,30 @@ version: "3.9"
 
 services:
   backend:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     volumes:
+      # Mount local directories for uploads and generated images
       - ./app/uploads:/app/app/uploads
       - ./app/generated:/app/app/generated
+      # Mount a named volume for Hugging Face model cache
+      - hf_cache:/root/.cache/huggingface
     environment:
       - PYTHONUNBUFFERED=1
+      - HF_HOME=/root/.cache/huggingface
+      # Add NVIDIA runtime configuration for GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # Use all available GPUs, or specify indices e.g., [0, 1]
+              capabilities: [gpu]
+
+# Define the named volume for the cache
+volumes:
+  hf_cache:
+
