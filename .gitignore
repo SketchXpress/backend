@@ -177,3 +177,9 @@ venv/
 generated
 
 uploads
+
+credentials.json
+
+Dockerfile
+
+docker-compose.yml

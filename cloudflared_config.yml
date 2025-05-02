@@ -1,0 +1,10 @@
+tunnel: 8abd1ff4-39ac-4fdd-8f11-51e5f96a32cb
+credentials-file: /etc/cloudflared/credentials.json # Adjust path based on where you run cloudflared
+
+ingress:
+  - hostname: api.sketchxpress.tech
+    # Points to the backend service within the Docker network
+    service: http://backend:8000
+  # Catch-all rule to prevent leaking the tunnel IP
+  - service: http_status:404
+

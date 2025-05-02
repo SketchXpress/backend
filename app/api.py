@@ -19,7 +19,7 @@ app = FastAPI()
 # Allow CORS for local frontend development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend domain
+    allow_origins=["http://localhost", "http://localhost:8000", "https://api.sketchxpress.tech"], # Allow tunnel hostname and localhost
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
