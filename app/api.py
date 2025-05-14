@@ -19,7 +19,13 @@ app = FastAPI()
 # Allow CORS for local frontend development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost", "http://localhost:8000", "https://sketchxpress.tech", "https://sketchxpress.vercel.app"],
+    allow_origins=[
+        "http://localhost", 
+        "http://localhost:8000", 
+        "https://sketchxpress.tech",       
+        "https://api.sketchxpress.tech",    
+        "https://sketchxpress.vercel.app"  
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
