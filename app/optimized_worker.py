@@ -1,4 +1,4 @@
-# app/worker.py
+# app/optimized_worker.py
 import os
 import logging
 import torch
@@ -22,7 +22,6 @@ CLEANUP_AGE_SECONDS = 3600 # 1 hour
 
 # Configure Celery
 # Use Redis as the broker and result backend
-# The REDIS_URL should be set as an environment variable, e.g., redis://redis:6379/0
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 celery_app = Celery(
     "worker",
@@ -43,11 +42,9 @@ celery_app.conf.update(
     # Configure Celery Beat schedule
     beat_schedule={
         "cleanup-old-files-hourly": {
-            "task": "app.worker.cleanup_old_files_task",
+            "task": "app.optimized_worker.cleanup_old_files_task",
             # Runs every hour at the start of the hour
             "schedule": crontab(minute=0, hour='*'),
-            # Alternatively, run every 3600 seconds:
-            # "schedule": timedelta(seconds=CLEANUP_AGE_SECONDS),
         },
     },
     timezone="UTC", # Explicitly set timezone
@@ -58,15 +55,40 @@ model_instance: Optional[EnhancedDiffusionModel] = None
 
 @worker_process_init.connect
 def init_worker(**kwargs):
-    """Initialize the model when a Celery worker process starts."""
+    """Initialize the model when a Celery worker process starts with safety disabled."""
     global model_instance
     logger.info("Initializing model for Celery worker...")
     try:
         use_cuda = torch.cuda.is_available()
+        # Initialize with only supported parameters
         model_instance = EnhancedDiffusionModel(
-            output_dir=GENERATED_DIR, # Use absolute path
-            use_cuda=use_cuda
+            output_dir=GENERATED_DIR,
+            use_cuda=use_cuda,
+            # Initialize with safety off from the start
+            safety_level="NONE",
+            allow_nsfw=True
         )
+        
+        # Ensure safety features are completely disabled
+        if hasattr(model_instance, 'pipe'):
+            if hasattr(model_instance.pipe, 'safety_checker'):
+                model_instance.pipe.safety_checker = None
+                logger.warning("Safety checker has been forcibly removed.")
+                
+            if hasattr(model_instance.pipe, 'requires_safety_checker'):
+                model_instance.pipe.requires_safety_checker = False
+                
+            if hasattr(model_instance.pipe, 'config') and hasattr(model_instance.pipe.config, 'requires_safety_checker'):
+                model_instance.pipe.config.requires_safety_checker = False
+        
+        # Use custom methods if available
+        if hasattr(model_instance, 'set_safety_checker_enabled'):
+            model_instance.set_safety_checker_enabled(False)
+            
+        if hasattr(model_instance, 'enable_nsfw_generation'):
+            model_instance.enable_nsfw_generation()
+            
+        logger.warning("⚠️ Safety checker has been disabled for image generation.")
         logger.info("Model initialized successfully in Celery worker.")
     except Exception as e:
         logger.error(f"Failed to initialize model in Celery worker: {e}", exc_info=True)
@@ -102,6 +124,38 @@ def cleanup_old_files_task():
     logger.info(f"Cleanup task finished. Deleted {deleted_count} files.")
     return {"status": "completed", "deleted_count": deleted_count}
 
+@celery_app.task(bind=True)
+def analyze_sketch_task(
+    self,
+    sketch_path: str,
+    job_id: Optional[str] = None
+) -> Dict:
+    """Celery task to analyze a sketch using the pre-loaded model."""
+    global model_instance
+    if model_instance is None:
+        logger.error("Model not initialized in worker. Cannot process task.")
+        self.update_state(state="FAILURE", meta={"message": "Model not initialized"})
+        raise RuntimeError("Model not initialized in worker")
+
+    if job_id is None:
+        job_id = self.request.id
+
+    logger.info(f"Starting sketch analysis task {job_id}")
+
+    try:
+        analysis_result = model_instance.analyze_sketch(sketch_path)
+        
+        logger.info(f"Sketch analysis complete for task {job_id}")
+        return {
+            "status": "completed",
+            "analysis": analysis_result
+        }
+
+    except Exception as e:
+        logger.error(f"Error in sketch analysis task {job_id}: {str(e)}", exc_info=True)
+        error_msg = ModelErrorHandler.handle_generation_error(e, job_id)
+        self.update_state(state="FAILURE", meta={"message": error_msg})
+        raise RuntimeError(f"Sketch analysis failed: {error_msg}")
 
 @celery_app.task(bind=True)
 def generate_images_task(
@@ -116,7 +170,7 @@ def generate_images_task(
     guidance_scale: float,
     job_id: str # Use the task ID as the job ID
 ) -> Dict:
-    """Celery task to generate images using the pre-loaded model."""
+    """Celery task to generate images using the pre-loaded model with safety disabled."""
     global model_instance
     if model_instance is None:
         logger.error("Model not initialized in worker. Cannot process task.")
@@ -125,27 +179,52 @@ def generate_images_task(
 
     logger.info(f"Starting image generation task {job_id}")
 
+    # Double-check safety is disabled for this specific task
+    if hasattr(model_instance, 'pipe') and hasattr(model_instance.pipe, 'safety_checker'):
+        model_instance.pipe.safety_checker = None
+        
+    if hasattr(model_instance, 'enable_nsfw_generation'):
+        model_instance.enable_nsfw_generation()
+
     def progress_callback(progress: float, images: List[str]):
         """Callback to update Celery task state with progress."""
         relative_image_paths = [path.replace("/app/app", "") for path in images]
         self.update_state(state="PROGRESS", meta={
             "progress": progress,
-            "images": relative_image_paths
+            "images": relative_image_paths,
+            "safety_disabled": True
         })
 
     try:
-        image_paths = model_instance.generate_images_with_progress(
-            sketch_path=sketch_path,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_images=num_images,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            temperature=temperature,
-            guidance_scale=guidance_scale,
-            job_id=job_id,
-            callback=progress_callback
-        )
+        # Try with allow_nsfw parameter
+        try:
+            image_paths = model_instance.generate_images_with_progress(
+                sketch_path=sketch_path,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_images=num_images,
+                num_inference_steps=num_inference_steps,
+                seed=seed,
+                temperature=temperature,
+                guidance_scale=guidance_scale,
+                job_id=job_id,
+                callback=progress_callback,
+                allow_nsfw=True
+            )
+        except TypeError:
+            # Fall back if parameter not supported
+            image_paths = model_instance.generate_images_with_progress(
+                sketch_path=sketch_path,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_images=num_images,
+                num_inference_steps=num_inference_steps,
+                seed=seed,
+                temperature=temperature,
+                guidance_scale=guidance_scale,
+                job_id=job_id,
+                callback=progress_callback
+            )
 
         relative_image_paths = [path.replace("/app/app", "") for path in image_paths]
 
@@ -153,7 +232,8 @@ def generate_images_task(
         return {
             "status": "completed",
             "progress": 100.0,
-            "images": relative_image_paths
+            "images": relative_image_paths,
+            "safety_disabled": True
         }
 
     except Exception as e:
@@ -161,4 +241,3 @@ def generate_images_task(
         error_msg = ModelErrorHandler.handle_generation_error(e, job_id)
         self.update_state(state="FAILURE", meta={"message": error_msg})
         raise
-

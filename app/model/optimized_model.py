@@ -20,10 +20,10 @@ from transformers import CLIPTextModel, CLIPTokenizer, pipeline, CLIPFeatureExtr
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from torchvision.transforms import transforms
 
-logger = logging.getLogger("enhanced_model")
+logger = logging.getLogger("optimized_model")
 logging.basicConfig(level=logging.INFO)
 
-# Add this at the module level, before the EnhancedDiffusionModel class
+# Global progress handler for diffusers pipelines
 class DiffusersProgressCallback:
     """Global progress handler for diffusers pipelines"""
     active_callbacks = {}  # Map job_ids to callback functions
@@ -97,8 +97,8 @@ class EnhancedDiffusionModel:
         use_latent_diffusion: bool = True,
         cache_models: bool = True,
         dynamic_thresholding: bool = True,
-        safety_level: str = "MEDIUM",  # Options: "NONE", "WEAK", "MEDIUM", "STRONG", "MAX"
-        allow_nsfw: bool = False  # New parameter for NSFW generation
+        safety_level: str = "NONE",  # Default to NONE as per requirements
+        allow_nsfw: bool = True  # Default to True as per requirements
     ):
         self.temperature = temperature
         self.guidance_scale = guidance_scale
@@ -137,40 +137,15 @@ class EnhancedDiffusionModel:
             )
             
             # Load base Stable Diffusion pipeline with ControlNet
-            if self.allow_nsfw:
-                # Completely bypass safety checker for NSFW generation
-                self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
-                    self.base_model,
-                    controlnet=self.controlnet,
-                    torch_dtype=torch_dtype,
-                    safety_checker=None,
-                    requires_safety_checker=False,
-                    use_safetensors=True
-                )
-            else:
-                # Load safety checker and feature extractor
-                safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-                    "CompVis/stable-diffusion-safety-checker",
-                    torch_dtype=torch_dtype
-                )
-                feature_extractor = CLIPFeatureExtractor.from_pretrained(
-                    "openai/clip-vit-base-patch32"
-                )
-                
-                self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
-                    self.base_model,
-                    controlnet=self.controlnet,
-                    torch_dtype=torch_dtype,
-                    safety_checker=safety_checker,
-                    feature_extractor=feature_extractor,
-                    use_safetensors=True
-                )
-                
-                # Apply safety level configurations
-                if self.safety_level == "NONE":
-                    self.set_safety_checker_enabled(False)
-                elif self.safety_level != "MAX":
-                    self.create_custom_safety_checker()
+            # Always bypass safety checker as per requirements
+            self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
+                self.base_model,
+                controlnet=self.controlnet,
+                torch_dtype=torch_dtype,
+                safety_checker=None,
+                requires_safety_checker=False,
+                use_safetensors=True
+            )
 
             # Choose appropriate scheduler
             if self.scheduler_type == "ddim":
@@ -200,65 +175,18 @@ class EnhancedDiffusionModel:
                 
             self.pipe.to(device)
             
-            # Load evaluation models if needed
-            self._initialize_evaluation_models()
-            
             # Load sketch analysis model
             self._initialize_sketch_recognition()
             
+            # Ensure safety is disabled
+            self.enable_nsfw_generation()
+            
             logger.info(f"Model initialized successfully on {device} using {self.scheduler_type} scheduler")
+            logger.warning("⚠️ Safety checker has been disabled for image generation.")
             
         except Exception as e:
             logger.error(f"Model initialization failed: {e}")
             raise
-
-    def create_custom_safety_checker(self):
-        """Create a custom safety checker that detects but doesn't black out images"""
-        original_safety_checker = self.pipe.safety_checker
-        feature_extractor = self.pipe.feature_extractor
-        
-        def custom_safety_checker(clip_input, images):
-            # Return original images but still detect NSFW content
-            if original_safety_checker is not None and feature_extractor is not None:
-                safety_checker_input = feature_extractor(images, return_tensors="pt").to(original_safety_checker.device)
-                _, has_nsfw_concepts = original_safety_checker(
-                    images=safety_checker_input.pixel_values,
-                    clip_input=clip_input
-                )
-                # Key difference: return original images, not black ones
-                return images, has_nsfw_concepts
-            else:
-                return images, [False] * len(images)
-        
-        # Replace the safety checker with our custom version
-        self.pipe.safety_checker = custom_safety_checker
-
-    def set_safety_checker_enabled(self, enabled: bool = True):
-        """Enable or disable the safety checker"""
-        if not enabled:
-            logger.warning("Safety checker being disabled. Ensure you're using this responsibly.")
-            # Store but don't use the safety checker
-            self._stored_safety_checker = self.pipe.safety_checker
-            self.pipe.safety_checker = None
-            # These additional settings ensure the safety checker stays disabled
-            setattr(self.pipe, "requires_safety_checker", False)
-            if hasattr(self.pipe.config, "requires_safety_checker"):
-                self.pipe.config.requires_safety_checker = False
-        else:
-            # Restore the safety checker if it was previously stored
-            if hasattr(self, "_stored_safety_checker") and self._stored_safety_checker is not None:
-                self.pipe.safety_checker = self._stored_safety_checker
-                if hasattr(self.pipe.config, "requires_safety_checker"):
-                    self.pipe.config.requires_safety_checker = True
-            elif self.pipe.safety_checker is None and not self.allow_nsfw:
-                # Re-initialize if needed
-                self.pipe.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-                    "CompVis/stable-diffusion-safety-checker",
-                    torch_dtype=self.pipe.dtype
-                )
-                self.pipe.feature_extractor = CLIPFeatureExtractor.from_pretrained(
-                    "openai/clip-vit-base-patch32"
-                )
 
     def enable_nsfw_generation(self):
         """Bullet-proof method to enable NSFW image generation"""
@@ -292,11 +220,6 @@ class EnhancedDiffusionModel:
         except Exception as e:
             logger.error(f"Sketch recognition model failed to load: {e}")
             raise
-            
-    def _initialize_evaluation_models(self):
-        """Load models for evaluating generation quality (CLIP, FID)"""
-        # Only load these if specifically requested to save memory
-        pass
     
     def _apply_dynamic_thresholding(self, latents, threshold_pct=0.95):
         """Apply dynamic thresholding to prevent oversaturation"""
@@ -331,11 +254,6 @@ class EnhancedDiffusionModel:
         except Exception as e:
             logger.error(f"Sketch analysis failed: {e}")
             raise
-            
-    def evaluate_generation(self, images: List[Image.Image], prompts: List[str]) -> Dict:
-        """Evaluate the quality of generated images using metrics like CLIP score"""
-        # This would implement evaluation metrics - left as a placeholder
-        return {"quality_score": 0.8}
 
     def generate_images_with_progress(
         self,
@@ -357,10 +275,6 @@ class EnhancedDiffusionModel:
             job_id = str(uuid.uuid4())
 
         logger.info(f"Starting generation for job {job_id}")
-        
-        # Check if NSFW generation should be enabled for this specific job
-        if allow_nsfw is not None and allow_nsfw and not self.allow_nsfw:
-            self.enable_nsfw_generation()
         
         # Register callback with our global registry
         if callback:
@@ -385,119 +299,78 @@ class EnhancedDiffusionModel:
             sketch = sketch.resize((512, 512))
 
             if prompt is None:
-                analysis = self.analyze_sketch(sketch_path)
-                prompt = f"high quality, detailed {analysis['top_class']}, professional"
-
-            logger.info(f"Using prompt: {prompt}")
-            
-            # Report progress after sketch loading and analysis
-            if callback:
-                callback(5.0, [])
+                prompt = ""
                 
-        except Exception as e:
-            logger.error(f"Failed to load sketch: {e}")
-            if callback:
-                callback(0.0, [])
-            raise
+            # Apply style modifiers if provided
+            if styles and isinstance(styles, list) and len(styles) > 0:
+                style_prompt = ", ".join(styles)
+                if prompt:
+                    prompt = f"{prompt}, {style_prompt}"
+                else:
+                    prompt = style_prompt
 
-        if styles is None:
-            styles = [
-                "realistic, detailed, high resolution",
-                "artistic, colorful, creative",
-                "minimalist, clean lines, simple",
-                "professional, technical illustration"
-            ]
-
-        image_paths = []
-        
-        # Create a TqdmCallback factory function
-        def tqdm_with_job_id(*args, **kwargs):
-            kwargs["job_id"] = job_id
-            kwargs["image_idx"] = getattr(tqdm_with_job_id, "image_idx", 0)
-            kwargs["total_images"] = num_images
-            return GlobalProgressTqdm(*args, **kwargs)
-        
-        # Store original tqdm
-        import diffusers.utils
-        original_tqdm = diffusers.utils.tqdm
-        
-        try:
-            # Replace diffusers tqdm with our version
-            diffusers.utils.tqdm = tqdm_with_job_id
+            # Prepare for batch generation
+            batch_count = (num_images + self.batch_size - 1) // self.batch_size
+            all_image_paths = []
             
-            for i in range(num_images):
-                try:
-                    # Update the image index for progress tracking
-                    tqdm_with_job_id.image_idx = i
-                    
-                    styled_prompt = f"{prompt}, {styles[i % len(styles)]}"
-                    
-                    # Generate the image
+            for batch_idx in range(batch_count):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(start_idx + self.batch_size, num_images)
+                batch_size = end_idx - start_idx
+                
+                logger.info(f"Generating batch {batch_idx+1}/{batch_count} ({batch_size} images)")
+                
+                # Create a custom tqdm instance for this batch
+                custom_tqdm = lambda *args, **kwargs: GlobalProgressTqdm(
+                    *args, 
+                    **kwargs,
+                    job_id=job_id,
+                    image_idx=batch_idx,
+                    total_images=batch_count
+                )
+                
+                # Generate images
+                with torch.no_grad():
                     output = self.pipe(
-                        prompt=styled_prompt,
-                        image=sketch,
-                        negative_prompt=negative_prompt,
+                        prompt=[prompt] * batch_size,
+                        image=[sketch] * batch_size,
+                        negative_prompt=[negative_prompt] * batch_size,
                         num_inference_steps=num_inference_steps,
                         guidance_scale=self.guidance_scale,
                         generator=generator,
-                        return_dict=True
+                        callback=custom_tqdm
                     )
-
-                    # Handle potentially NSFW content
-                    images = output.images
-                    nsfw_detected = getattr(output, "nsfw_content_detected", [False] * len(images))
-
-                    for j, (img, is_nsfw) in enumerate(zip(images, nsfw_detected)):
-                        img_path = os.path.join(self.output_dir, f"{job_id}_{i}_{j}.png")
-                        
-                        if is_nsfw:
-                            logger.warning(f"NSFW content detected in image {i}_{j}")
-                            
-                            # Apply different handling based on safety level
-                            if self.safety_level == "STRONG" and not self.allow_nsfw:
-                                # Apply heavy blur to NSFW content
-                                img = img.filter(ImageFilter.GaussianBlur(radius=30))
-                            elif self.safety_level == "MEDIUM" and not self.allow_nsfw:
-                                # Apply light blur
-                                img = img.filter(ImageFilter.GaussianBlur(radius=10))
-                            # WEAK and NONE levels keep image as is
-                        
-                        img.save(img_path, compress_level=1)
-                        image_paths.append(img_path)
-
-                    # Update images in our registry after each image
-                    if callback:
-                        DiffusersProgressCallback.update(job_id, 
-                                                      ((i+1) * 100.0) / num_images, 
-                                                      image_paths)
-                        
-                except Exception as e:
-                    logger.error(f"Error generating image {i+1}: {e}")
-                    continue
                 
-        finally:
-            # Restore original tqdm
-            diffusers.utils.tqdm = original_tqdm
+                # Save generated images
+                batch_image_paths = []
+                if save_results:
+                    for i, image in enumerate(output.images):
+                        global_idx = start_idx + i
+                        filename = f"{job_id}_{global_idx}.png"
+                        save_path = os.path.join(self.output_dir, filename)
+                        
+                        # Apply any post-processing here if needed
+                        
+                        # Save with optimized compression
+                        image.save(save_path, format="PNG", optimize=True)
+                        batch_image_paths.append(save_path)
+                        
+                        # Update progress after each image is saved
+                        if callback:
+                            progress = ((batch_idx * self.batch_size + i + 1) / num_images) * 100
+                            all_paths_so_far = all_image_paths + batch_image_paths
+                            DiffusersProgressCallback.update(job_id, progress, all_paths_so_far)
+                
+                all_image_paths.extend(batch_image_paths)
             
-            # Ensure final progress is reported
+            # Clean up
             if callback:
-                callback(100.0, image_paths)
+                DiffusersProgressCallback.unregister(job_id)
                 
-            # Clean up the registry
-            DiffusersProgressCallback.unregister(job_id)
+            return all_image_paths
 
-        logger.info(f"Completed {len(image_paths)} images for job {job_id}")
-        return image_paths
-
-    def rank_images(self, image_paths: List[str]) -> List[str]:
-        """Sort generated images by estimated quality"""
-        # Could implement more sophisticated ranking using CLIP or other metrics
-        return image_paths
-        
-    def cleanup(self):
-        """Release model resources when done"""
-        if not self.cache_models:
-            self.pipe = None
-            self.controlnet = None
-            self.sketch_classifier = None
-            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Error generating images: {e}")
+            if callback:
+                DiffusersProgressCallback.unregister(job_id)
+            raise

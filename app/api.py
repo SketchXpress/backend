@@ -1,32 +1,39 @@
 # app/api.py
 import os
-import shutil
 import uuid
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+import logging
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from celery.result import AsyncResult
+from pydantic import BaseModel, Field
+import time
 
-# Import the Celery app instance and the task
-from app.worker import celery_app, generate_images_task
-# We might need a separate task for analysis if we want it async
-# from app.worker import analyze_sketch_task # Assuming this exists
+# Import from optimized worker instead of the original worker
+from app.optimized_worker import celery_app, generate_images_task, analyze_sketch_task
 
-# Initialize FastAPI app
-app = FastAPI()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("api")
 
-# Allow CORS for local frontend development
+# Create FastAPI app
+app = FastAPI(
+    title="SketchXpress API",
+    description="API for transforming sketches into detailed images using AI",
+    version="1.0.0"
+)
+
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost", "http://localhost:8000", "https://api.sketchxpress.tech", "https://sketchxpress.tech"],
+    allow_origins=["*"],  # For production, specify exact origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# Define directories (relative to WORKDIR /app)
+# Define directories
 UPLOAD_DIR = "app/uploads"
 GENERATED_DIR = "app/generated"
 
@@ -34,99 +41,198 @@ GENERATED_DIR = "app/generated"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
-# Serve generated images publicly (relative to WORKDIR /app)
-# The path in StaticFiles must match the container path
-# The mount path "/generated" is the URL path
+# Mount static directories
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/generated", StaticFiles(directory=GENERATED_DIR), name="generated")
 
-# No need to initialize ModelIntegration here anymore
+# Define response models
+class GenerationResponse(BaseModel):
+    status: str
+    job_id: str
 
-@app.post("/api/generate")
-async def generate(
+class StatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: float = 0.0
+    images: List[str] = []
+    message: str = ""
+
+class AnalysisResponse(BaseModel):
+    job_id: str
+    status: str
+    analysis: Dict[str, Any] = {}
+    message: str = ""
+
+@app.get("/")
+async def root():
+    return {"message": "SketchXpress API is running. Visit /docs for documentation."}
+
+@app.post("/api/generate", response_model=GenerationResponse)
+async def generate_images(
     sketch: UploadFile = File(...),
-    prompt: str = Form(None),
+    prompt: Optional[str] = Form(None),
+    negative_prompt: str = Form("lowres, bad anatomy, bad hands, cropped, worst quality"),
     temperature: float = Form(0.65),
     guidance_scale: float = Form(7.5),
-    num_images: int = Form(1), # Default back to 1 for faster testing?
+    num_images: int = Form(1),
     steps: int = Form(30),
-    seed: int = Form(None)
+    seed: Optional[int] = Form(None)
 ):
     try:
-        # Create a unique job ID (can use UUID)
+        # Generate a unique job ID
         job_id = str(uuid.uuid4())
-        # Save the uploaded sketch using an absolute path within the container
-        sketch_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"{job_id}_{sketch.filename}"))
-        with open(sketch_path, "wb") as buffer:
-            shutil.copyfileobj(sketch.file, buffer)
-
-        # Send the task to the Celery queue
-        task_result = generate_images_task.apply_async(
-            args=[
-                sketch_path,
-                prompt,
-                "lowres, bad anatomy, bad hands, cropped, worst quality", # negative_prompt
-                num_images,
-                steps,
-                seed,
-                temperature,
-                guidance_scale,
-                job_id # Pass job_id to task
-            ],
-            task_id=job_id # Use our generated UUID as the Celery task ID
+        
+        # Save the uploaded sketch
+        sketch_filename = f"{job_id}_sketch.png"
+        sketch_path = os.path.join(UPLOAD_DIR, sketch_filename)
+        
+        with open(sketch_path, "wb") as f:
+            f.write(await sketch.read())
+        
+        logger.info(f"Saved sketch to {sketch_path}")
+        
+        # Submit the generation task to Celery
+        task = generate_images_task.delay(
+            sketch_path=sketch_path,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_images=num_images,
+            num_inference_steps=steps,
+            seed=seed,
+            temperature=temperature,
+            guidance_scale=guidance_scale,
+            job_id=job_id
         )
-
-        return {"status": "queued", "job_id": task_result.id}
-
+        
+        logger.info(f"Submitted generation task with ID: {job_id}")
+        
+        return {"status": "queued", "job_id": job_id}
+        
     except Exception as e:
-        # Basic error handling for API level issues (e.g., file save)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Failed to queue task: {str(e)}"}
+        logger.error(f"Error in generate_images: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze", response_model=AnalysisResponse)
+async def analyze_sketch(
+    sketch: UploadFile = File(...),
+):
+    try:
+        # Generate a unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Save the uploaded sketch
+        sketch_filename = f"{job_id}_sketch.png"
+        sketch_path = os.path.join(UPLOAD_DIR, sketch_filename)
+        
+        with open(sketch_path, "wb") as f:
+            f.write(await sketch.read())
+        
+        logger.info(f"Saved sketch to {sketch_path}")
+        
+        # Submit the analysis task to Celery
+        task = analyze_sketch_task.delay(
+            sketch_path=sketch_path,
+            job_id=job_id
         )
+        
+        logger.info(f"Submitted analysis task with ID: {job_id}")
+        
+        return {"status": "queued", "job_id": job_id, "analysis": {}, "message": "Analysis queued"}
+        
+    except Exception as e:
+        logger.error(f"Error in analyze_sketch: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/status/{job_id}")
-async def get_status(job_id: str):
-    """Get the status of a Celery task."""
-    task_result = AsyncResult(job_id, app=celery_app)
+@app.get("/api/status/{job_id}", response_model=StatusResponse)
+async def check_status(job_id: str):
+    try:
+        # Check if the task exists
+        task = celery_app.AsyncResult(job_id)
+        
+        if task.state == "PENDING":
+            return {
+                "job_id": job_id,
+                "status": "pending",
+                "progress": 0.0,
+                "images": [],
+                "message": "Task is pending."
+            }
+        elif task.state == "PROGRESS":
+            # For tasks that report progress
+            meta = task.info or {}
+            return {
+                "job_id": job_id,
+                "status": "in_progress",
+                "progress": meta.get("progress", 0.0),
+                "images": meta.get("images", []),
+                "message": "Task is in progress."
+            }
+        elif task.state == "SUCCESS":
+            result = task.result
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "progress": 100.0,
+                "images": result.get("images", []),
+                "message": "Task completed successfully."
+            }
+        elif task.state == "FAILURE":
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "progress": 0.0,
+                "images": [],
+                "message": str(task.info)
+            }
+        else:
+            return {
+                "job_id": job_id,
+                "status": task.state.lower(),
+                "progress": 0.0,
+                "images": [],
+                "message": f"Task is in state: {task.state}"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in check_status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    response = {
-        "job_id": job_id,
-        "status": task_result.state, # PENDING, STARTED, RETRY, FAILURE, SUCCESS, PROGRESS
-        "progress": 0.0,
-        "images": [],
-        "message": None
-    }
-
-    if task_result.state == "PENDING":
-        response["message"] = "Task is waiting in the queue."
-    elif task_result.state == "STARTED":
-        response["message"] = "Task has started processing."
-    elif task_result.state == "PROGRESS":
-        response["progress"] = task_result.info.get("progress", 0.0)
-        response["images"] = task_result.info.get("images", [])
-        response["message"] = "Task is in progress."
-    elif task_result.state == "SUCCESS":
-        result = task_result.get() # Get the final result dict
-        response["status"] = result.get("status", "completed") # Should be 'completed'
-        response["progress"] = result.get("progress", 100.0)
-        response["images"] = result.get("images", [])
-        response["message"] = "Task completed successfully."
-    elif task_result.state == "FAILURE":
-        response["message"] = str(task_result.info) # Get the exception info
-        # Optionally, retrieve custom error message if set in task failure meta
-        if isinstance(task_result.info, dict):
-             response["message"] = task_result.info.get("message", str(task_result.info))
-
-    # Handle case where job_id is not found (state will be PENDING, but maybe add explicit check?)
-    # Celery doesn't easily distinguish 'not found' from 'pending' without backend query
-
-    return response
-
-# TODO: Re-implement /api/analyze if needed, potentially as another Celery task
-# @app.post("/api/analyze")
-# async def analyze(sketch: UploadFile = File(...)):
-#     # ... save file ...
-#     # task_result = analyze_sketch_task.delay(sketch_path)
-#     # return {"status": "queued", "job_id": task_result.id}
-#     pass
-
+@app.get("/api/analysis/{job_id}", response_model=AnalysisResponse)
+async def check_analysis(job_id: str):
+    try:
+        # Check if the task exists
+        task = celery_app.AsyncResult(job_id)
+        
+        if task.state == "PENDING":
+            return {
+                "job_id": job_id,
+                "status": "pending",
+                "analysis": {},
+                "message": "Analysis is pending."
+            }
+        elif task.state == "SUCCESS":
+            result = task.result
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "analysis": result.get("analysis", {}),
+                "message": "Analysis completed successfully."
+            }
+        elif task.state == "FAILURE":
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "analysis": {},
+                "message": str(task.info)
+            }
+        else:
+            return {
+                "job_id": job_id,
+                "status": task.state.lower(),
+                "analysis": {},
+                "message": f"Analysis is in state: {task.state}"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in check_analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
