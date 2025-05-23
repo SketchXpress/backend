@@ -66,22 +66,87 @@ class GlobalProgressTqdm(tqdm):
         self.job_id = kwargs.pop("job_id", None)
         self.image_idx = kwargs.pop("image_idx", 0)
         self.total_images = kwargs.pop("total_images", 1)
-        super().__init__(*args, **kwargs)
+        
+        # Ensure the 'disable' attribute is set before super().__init__
+        # This prevents AttributeError during cleanup in tqdm.__del__
+        self.disable = kwargs.get('disable', False)
+        
+        # Handle tensor arguments safely
+        # Convert any tensor arguments to Python scalars to avoid ambiguity errors
+        for key, value in list(kwargs.items()):
+            if hasattr(value, 'item') and callable(getattr(value, 'item')):
+                try:
+                    kwargs[key] = value.item()
+                except:
+                    # If conversion fails, use a safe default
+                    if key == 'total':
+                        kwargs[key] = 100
+                    elif key == 'initial':
+                        kwargs[key] = 0
+        
+        # Ensure total is a valid number
+        if 'total' in kwargs and kwargs['total'] is None:
+            kwargs['total'] = 100
+            
+        # Initialize all standard tqdm attributes to prevent AttributeError during cleanup
+        self.n = 0
+        self.total = kwargs.get('total', 100)
+        self.desc = kwargs.get('desc', '')
+        
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"Error initializing tqdm: {e}")
+            # Ensure all critical attributes exist even if initialization fails
+            if not hasattr(self, 'n'):
+                self.n = 0
+            if not hasattr(self, 'total'):
+                self.total = 100
         
     def update(self, n=1):
         """Override update to report progress to our global registry"""
-        super().update(n)
-        
-        # Only report if we have a job_id
-        if self.job_id and self.total:
-            # Calculate overall progress as percentage
-            progress = min(100.0, (
-                (self.image_idx * 100.0 / self.total_images) + 
-                (self.n * 100.0 / (self.total * self.total_images))
-            ))
+        try:
+            # Convert tensor n to scalar if needed
+            if hasattr(n, 'item') and callable(getattr(n, 'item')):
+                try:
+                    n = n.item()
+                except:
+                    n = 1
             
-            # Report to the global registry
-            DiffusersProgressCallback.update(self.job_id, progress)
+            super().update(n)
+            
+            # Only report if we have a job_id
+            if self.job_id and hasattr(self, 'total') and self.total:
+                # Calculate overall progress as percentage
+                progress = min(100.0, (
+                    (self.image_idx * 100.0 / self.total_images) + 
+                    (self.n * 100.0 / (self.total * self.total_images))
+                ))
+                
+                # Report to the global registry
+                DiffusersProgressCallback.update(self.job_id, progress)
+        except Exception as e:
+            logger.warning(f"Error in progress update: {e}")
+            # Continue execution even if progress reporting fails
+            
+    def close(self):
+        """Override close to handle cleanup safely"""
+        try:
+            # Only call super().close() if it exists
+            if hasattr(super(), 'close'):
+                super().close()
+        except Exception as e:
+            logger.warning(f"Error in tqdm close: {e}")
+            
+    def __del__(self):
+        """Override __del__ to handle cleanup safely"""
+        try:
+            # Only call super().__del__() if it exists
+            if hasattr(super(), '__del__'):
+                super().__del__()
+        except Exception as e:
+            # Silently ignore errors during garbage collection
+            pass
 
 class EnhancedDiffusionModel:
     def __init__(
@@ -221,23 +286,28 @@ class EnhancedDiffusionModel:
             logger.error(f"Sketch recognition model failed to load: {e}")
             raise
     
-    def _apply_dynamic_thresholding(self, latents, threshold_pct=0.95):
-        """Apply dynamic thresholding to prevent oversaturation"""
-        if not self.dynamic_thresholding:
-            return latents
-            
-        # Calculate dynamic thresholding values
-        s = torch.quantile(
-            torch.abs(latents).reshape(latents.shape[0], -1),
-            threshold_pct,
-            dim=1
-        )
-        s = torch.maximum(s, torch.ones_like(s))
-        s = s.reshape(-1, 1, 1, 1)
+    def _create_safe_callback_wrapper(self, custom_callback, job_id):
+        """
+        Create a safe wrapper around custom callbacks to handle tensor arguments
+        and prevent errors from propagating to the main pipeline.
+        """
+        def safe_callback_wrapper(step_idx, t, latents, *args, **kwargs):
+            try:
+                # Convert tensor arguments to Python scalars if needed
+                if hasattr(step_idx, 'item') and callable(getattr(step_idx, 'item')):
+                    try:
+                        step_idx = step_idx.item()
+                    except:
+                        step_idx = 0
+                
+                # Call the original callback with sanitized arguments
+                return custom_callback(step_idx, t, latents, *args, **kwargs)
+            except Exception as e:
+                # Log the error but don't let it crash the pipeline
+                logger.warning(f"Error in callback for job {job_id}: {e}")
+                return None
         
-        # Apply dynamic thresholding
-        latents = torch.clamp(latents, -s, s) / s
-        return latents
+        return safe_callback_wrapper
 
     def analyze_sketch(self, sketch_path: str) -> dict:
         try:
@@ -321,25 +391,56 @@ class EnhancedDiffusionModel:
                 logger.info(f"Generating batch {batch_idx+1}/{batch_count} ({batch_size} images)")
                 
                 # Create a custom tqdm instance for this batch
-                custom_tqdm = lambda *args, **kwargs: GlobalProgressTqdm(
-                    *args, 
-                    **kwargs,
-                    job_id=job_id,
-                    image_idx=batch_idx,
-                    total_images=batch_count
-                )
+                # Wrap in try-except to prevent callback errors from crashing the pipeline
+                try:
+                    custom_tqdm = lambda *args, **kwargs: GlobalProgressTqdm(
+                        *args, 
+                        **kwargs,
+                        job_id=job_id,
+                        image_idx=batch_idx,
+                        total_images=batch_count
+                    )
+                    # Wrap the callback in a safety wrapper to handle tensor arguments
+                    custom_tqdm = self._create_safe_callback_wrapper(custom_tqdm, job_id)
+                except Exception as e:
+                    logger.warning(f"Error creating progress callback: {e}")
+                    custom_tqdm = None
                 
                 # Generate images
                 with torch.no_grad():
-                    output = self.pipe(
-                        prompt=[prompt] * batch_size,
-                        image=[sketch] * batch_size,
-                        negative_prompt=[negative_prompt] * batch_size,
-                        num_inference_steps=num_inference_steps,
-                        guidance_scale=self.guidance_scale,
-                        generator=generator,
-                        callback=custom_tqdm
-                    )
+                    try:
+                        # Set safe defaults for callback parameters
+                        callback_kwargs = {
+                            "prompt": [prompt] * batch_size,
+                            "image": [sketch] * batch_size,
+                            "negative_prompt": [negative_prompt] * batch_size,
+                            "num_inference_steps": num_inference_steps,
+                            "guidance_scale": self.guidance_scale,
+                            "generator": generator,
+                        }
+                        
+                        # Only add callback if it was created successfully
+                        if custom_tqdm is not None:
+                            callback_kwargs["callback"] = custom_tqdm
+                            callback_kwargs["callback_steps"] = 1  # Ensure callback_steps is always a valid integer
+                        
+                        output = self.pipe(**callback_kwargs)
+                    except Exception as e:
+                        logger.error(f"Error in diffusion pipeline: {e}")
+                        # Try again without callback if there was an error
+                        if custom_tqdm is not None:
+                            logger.warning("Retrying without progress callback")
+                            output = self.pipe(
+                                prompt=[prompt] * batch_size,
+                                image=[sketch] * batch_size,
+                                negative_prompt=[negative_prompt] * batch_size,
+                                num_inference_steps=num_inference_steps,
+                                guidance_scale=self.guidance_scale,
+                                generator=generator
+                            )
+                        else:
+                            # Re-raise if the error wasn't related to the callback
+                            raise
                 
                 # Save generated images
                 batch_image_paths = []
