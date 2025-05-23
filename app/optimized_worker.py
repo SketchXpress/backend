@@ -9,7 +9,7 @@ from celery.schedules import crontab
 from celery.signals import worker_process_init
 from typing import Optional, List, Dict
 
-from app.model.enhanced_model import EnhancedDiffusionModel
+from app.model.optimized_model import EnhancedDiffusionModel
 from app.model.error_handler import ModelErrorHandler
 
 logger = logging.getLogger("celery_worker")
