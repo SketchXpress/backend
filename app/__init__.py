@@ -1,0 +1,1 @@
+from app.optimized_worker import celery_app
